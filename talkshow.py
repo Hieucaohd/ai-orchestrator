@@ -446,48 +446,82 @@ def save_log(job: dict):
 
 # ---------------------------------------------------------------- xuat di
 
-def build_turns(job: dict) -> list:
+def exportable(items: list) -> list:
+    """
+    Danh so tung cau hoi / cau tra loi, tinh tu 1.
+
+    Chi nhung luot da xong va co chu moi duoc danh so — luot hong hay dang
+    chay thi bo qua, vi chung cung khong xuat di dau. Giao dien va phan xuat
+    deu goi ham nay nen con so ban nhin thay tren trang dung bang con so ban
+    go vao o "xuat tu ... den ...".
+
+    Tra ve list (so_thu_tu, item).
+    """
+    out = []
+    for it in items:
+        if it["status"] == "done" and (it.get("text") or "").strip():
+            out.append((len(out) + 1, it))
+    return out
+
+
+def build_turns(job: dict, first: int = None, last: int = None) -> list:
     """
     Doi buoi toa dam sang cac cap Ban/AI cua giao dien Chat AI trong AI Reader.
 
     Loi dan cua MC va cau hoi duoc gop lai thanh 1 luot, vi ngoai doi MC noi
     lien mach chu khong tach ra. Cac luot hong hoac dang chay thi bo qua.
+
+    first/last la khoang so thu tu muon xuat (tinh tu 1, lay ca hai dau).
+    De trong thi xuat het.
     """
     turns = []
-    for it in job["items"]:
-        if it["status"] != "done":
+    for num, it in exportable(job["items"]):
+        if first is not None and num < first:
             continue
-        text = (it.get("text") or "").strip()
-        if not text:
+        if last is not None and num > last:
             continue
         if it["role"] == "mc":
             lead = (it.get("lead") or "").strip()
+            text = it["text"].strip()
             turns.append({"speaker": "Bạn",
                           "text": f"{lead}\n\n{text}" if lead else text})
         else:
-            turns.append({"speaker": "AI", "text": text})
+            turns.append({"speaker": "AI", "text": it["text"].strip()})
 
     # Chu de di cung luot mo dau, khong tao them mot nguoi noi/cap rong.
+    # Van ghi ca khi xuat tu giua chung, de ben kia con biet dang ban gi.
     topic = (job.get("topic") or "").strip()
     if turns and topic:
         turns[0]["text"] = f"Chủ đề: {topic}\n\n{turns[0]['text']}"
     return turns
 
 
-def export_show(job_id: str, port=DEFAULT_EXPORT_PORT) -> dict:
-    """Gui ca buoi toa dam sang service khac. Goi tu phia server chu khong
-    tu trinh duyet, de khoi vuong CORS."""
+def export_show(job_id: str, port=DEFAULT_EXPORT_PORT,
+                first: int = None, last: int = None) -> dict:
+    """Gui buoi toa dam sang service khac. Goi tu phia server chu khong tu
+    trinh duyet, de khoi vuong CORS.
+
+    first/last gioi han khoang so thu tu muon xuat; de trong thi xuat het."""
     if not re.fullmatch(r"[0-9]{1,5}", str(port)) or not 1 <= int(port) <= 65535:
         raise ValueError("Port service phải là số nguyên từ 1 đến 65535.")
+    if first is not None and last is not None and first > last:
+        raise ValueError("Số bắt đầu phải nhỏ hơn hoặc bằng số kết thúc.")
+
     target = f"http://localhost:{int(port)}/api/import"
     with LOCK:
         job = JOBS.get(job_id)
         if job is None:
             raise KeyError("khong co buoi toa dam nao voi ma nay")
-        payload = {"source": EXPORT_SOURCE, "turns": build_turns(job)}
+        tong = len(exportable(job["items"]))
+        payload = {"source": EXPORT_SOURCE,
+                   "turns": build_turns(job, first, last)}
 
     if not payload["turns"]:
-        raise RuntimeError("buoi nay chua co noi dung gi de xuat")
+        if tong == 0:
+            raise RuntimeError("buoi nay chua co noi dung gi de xuat")
+        raise RuntimeError(
+            f"khoang {first}-{last} khong co luot nao. "
+            f"Buoi nay danh so tu 1 den {tong}.")
 
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     headers = {"Content-Type": "application/json; charset=utf-8"}
@@ -949,6 +983,7 @@ PAGE = """<!doctype html>
   .export-port { display: flex; gap: 6px; align-items: center;
                  font-size: 13px; color: var(--muted); }
   #export-port { width: 96px; height: 38px; }
+  #export-from, #export-to { width: 74px; height: 38px; }
   select { flex: 1; min-width: 260px; padding: 8px 10px; border: 1px solid var(--line);
     border-radius: 9px; background: var(--card); color: var(--text);
     font: inherit; font-size: 13px; }
@@ -966,6 +1001,9 @@ PAGE = """<!doctype html>
   .who { font-size: 12px; font-weight: 650; margin-bottom: 5px;
          display: flex; gap: 8px; align-items: center; }
   .who .t { color: var(--muted); font-weight: 400; }
+  .who .stt { font-family: ui-monospace, Consolas, monospace; font-weight: 700;
+              background: var(--line); color: var(--muted);
+              padding: 1px 6px; border-radius: 5px; font-size: 11px; }
   .mc .who { color: var(--mc); }
   .guest .who { color: var(--guest); }
   .bubble { padding: 12px 15px; border-radius: 11px; white-space: pre-wrap;
@@ -1048,6 +1086,14 @@ PAGE = """<!doctype html>
       <input type="number" id="export-port" value="__EXPORT_PORT__"
              min="1" max="65535" step="1" inputmode="numeric" required>
     </label>
+    <label class="export-port">Xuất từ
+      <input type="number" id="export-from" min="1" step="1"
+             inputmode="numeric" placeholder="đầu">
+    </label>
+    <label class="export-port">đến
+      <input type="number" id="export-to" min="1" step="1"
+             inputmode="numeric" placeholder="cuối">
+    </label>
     <button id="export" class="small" disabled>Xuất hội thoại</button>
   </div>
   <div class="hint" id="hint"></div>
@@ -1128,12 +1174,18 @@ function draw(job) {
     feed.textContent = "Dang cho MC mo dau...";
     return;
   }
+  // Danh so y het ham exportable() ben server: chi luot da xong va co chu.
+  // Nho vay con so tren man hinh dung bang con so go vao o "xuat tu ... den".
+  let stt = 0;
   for (const it of job.items) {
+    const so = (it.status === "done" && (it.text || "").trim()) ? ++stt : null;
+
     const wrap = el("div", "turn " + it.role + (it.status === "error" ? " err" : ""));
     const who = el("div", "who");
     const label = it.role === "mc"
       ? (it.turn === 0 ? "MC — lời kết" : "MC · lượt " + it.turn)
       : "Khách mời · lượt " + it.turn;
+    if (so !== null) who.appendChild(el("span", "stt", "#" + so));
     who.appendChild(el("span", null, label));
     who.appendChild(el("span", "t",
       it.status === "running" ? "đang trả lời..." :
@@ -1396,14 +1448,25 @@ async function exportShow() {
   if (!exportPortInput.reportValidity()) return;
   const port = exportPortInput.valueAsNumber;
   rememberExportPort();
+
+  // O trong = xuat het. Server tu hieu tham so rong.
+  const tu = document.getElementById("export-from").value.trim();
+  const den = document.getElementById("export-to").value.trim();
+  if (tu && den && Number(tu) > Number(den)) {
+    document.getElementById("hint").textContent =
+      "So bat dau phai nho hon hoac bang so ket thuc.";
+    return;
+  }
+
   const hint = document.getElementById("hint");
   const btn = document.getElementById("export");
   hint.textContent = "Dang xuat...";
   exporting = true;
   btn.disabled = true;
   try {
-    const data = await (await fetch("/api/export?id=" + jobId + "&port=" + port,
-                                    {method: "POST"})).json();
+    const url = "/api/export?id=" + jobId + "&port=" + port +
+                "&from=" + encodeURIComponent(tu) + "&to=" + encodeURIComponent(den);
+    const data = await (await fetch(url, {method: "POST"})).json();
     if (data.error) {
       hint.textContent = "Xuất thất bại: " + data.error;
     } else {
@@ -1651,8 +1714,14 @@ class Handler(BaseHTTPRequestHandler):
             query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             job_id = (query.get("id") or [""])[0]
             port = query.get("port", [DEFAULT_EXPORT_PORT])[0]
+
+            def so(ten):
+                """Doc so thu tu tu URL; de trong hoac khong phai so -> None."""
+                raw = (query.get(ten) or [""])[0].strip()
+                return int(raw) if raw.isdigit() and int(raw) > 0 else None
+
             try:
-                result = export_show(job_id, port)
+                result = export_show(job_id, port, so("from"), so("to"))
             except Exception as e:
                 return self._send(400, json.dumps({"error": str(e)},
                                                   ensure_ascii=False))
