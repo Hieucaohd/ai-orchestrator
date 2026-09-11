@@ -1051,6 +1051,44 @@ PAGE = """<!doctype html>
   .sheet-actions { display: flex; gap: 10px; align-items: center;
                    position: sticky; bottom: 0; background: var(--bg);
                    padding: 12px 0 2px; border-top: 1px solid var(--line); }
+  /* Thanh vach ben canh thanh cuon: moi vach la mot cau hoi cua MC.
+     Ro chuot vao thanh thi vach dai ra; ro vao tung vach thi hien cau hoi. */
+  .rail { position: fixed; right: 0; top: 0; bottom: 0; width: 26px;
+          z-index: 14; display: none; }
+  .rail.on { display: block; }
+  .rail::before {            /* vung ro chuot rong hon vach cho de trung */
+    content: ""; position: absolute; inset: 0;
+  }
+  .rail .tick {
+    position: absolute; right: 7px; height: 2px; width: 11px;
+    margin-top: -1px; border-radius: 2px; cursor: pointer;
+    background: var(--muted); opacity: .4;
+    transition: width .12s ease, opacity .12s ease, background .12s ease;
+  }
+  .rail .tick::after {
+    /* Noi rong vung bat chuot sang NGANG cho de tro trung thanh vach.
+       Tuyet doi khong noi theo chieu doc: buoi dai thi cac vach chi cach
+       nhau vai pixel, noi doc la chung de len nhau va chan mat nhau. */
+    content: ""; position: absolute; inset: 0 -8px 0 -14px;
+  }
+  .rail .tick.end { width: 17px; opacity: .6; }
+  .rail:hover .tick { width: 19px; opacity: .75; }
+  .rail:hover .tick.end { width: 24px; }
+  .rail .tick:hover, .rail .tick.here {
+    width: 26px; right: 3px; opacity: 1; height: 3px; background: var(--mc);
+  }
+  .rail-tip {
+    position: fixed; right: 38px; max-width: 400px; padding: 9px 12px;
+    background: var(--card); color: var(--text);
+    border: 1px solid var(--line); border-radius: 9px;
+    box-shadow: 0 4px 18px rgba(0, 0, 0, .25);
+    font-size: 12.5px; line-height: 1.5; z-index: 16;
+    display: none; pointer-events: none;
+  }
+  .rail-tip.on { display: block; }
+  .rail-tip b { color: var(--mc); font-family: ui-monospace, monospace; }
+  .rail-tip > div { margin-top: 5px; color: var(--muted); }
+
   /* Hai nut nhay dau/cuoi trang. Chi hien khi trang du dai de cuon. */
   .jump { position: fixed; right: 18px; bottom: 18px; z-index: 15;
           display: none; flex-direction: column; gap: 8px; }
@@ -1115,6 +1153,9 @@ PAGE = """<!doctype html>
   <button id="to-bottom" title="Xuống cuối trang" aria-label="Xuống cuối trang">↓</button>
 </div>
 
+<div class="rail" id="rail"></div>
+<div class="rail-tip" id="rail-tip"></div>
+
 <div class="sheet" id="sheet">
   <div class="sheet-box">
     <h2>Mẫu prompt</h2>
@@ -1136,6 +1177,8 @@ let timer = null, jobId = null, exporting = false;
 let focusDraft = "", extraDraft = 3;
 // Bang duyet prompt: giu ban go do vi draw() ve lai feed moi 900ms
 let reviewDraft = null, reviewSeq = -1;
+// Cac vach ben thanh cuon, moi vach ung voi mot cau hoi cua MC
+let railMarks = [];
 const exportPortInput = document.getElementById("export-port");
 const EXPORT_PORT_KEY = "talkshow.exportPort";
 try {
@@ -1192,6 +1235,7 @@ function draw(job) {
   // Danh so y het ham exportable() ben server: chi luot da xong va co chu.
   // Nho vay con so tren man hinh dung bang con so go vao o "xuat tu ... den".
   let stt = 0;
+  const marks = [];          // moi cau hoi cua MC -> mot vach ben thanh cuon
   for (const it of job.items) {
     const so = (it.status === "done" && (it.text || "").trim()) ? ++stt : null;
 
@@ -1216,6 +1260,15 @@ function draw(job) {
     }
     wrap.appendChild(bubble);
     feed.appendChild(wrap);
+
+    // Chi cau hoi cua MC moi co vach — khach moi tra loi ngay duoi do
+    if (it.role === "mc" && (it.text || "").trim()) {
+      marks.push({
+        el: wrap, num: so, closing: it.turn === 0,
+        label: it.turn === 0 ? "Lời kết" : "Lượt " + it.turn,
+        text: it.text.trim().slice(0, 300),
+      });
+    }
   }
 
   // Buoi con do dang -> nut chay tiep tu dung cho hong, khong lam lai ca buoi
@@ -1235,6 +1288,7 @@ function draw(job) {
   if (!job.running && job.finished) feed.appendChild(extendPanel());
 
   toggleJump();   // do dai trang vua doi, tinh lai xem con can nut cuon khong
+  buildRail(marks);
 }
 
 function reviewPanel(rv) {
@@ -1440,6 +1494,73 @@ async function poll() {
   }
 }
 
+function buildRail(marks) {
+  // Moi vach dat dung vi tri cua cau hoi do tren toan trang, nen no xep
+  // thang hang voi thanh cuon chu khong chia deu mot cach vo nghia.
+  const rail = document.getElementById("rail");
+  rail.innerHTML = "";
+  railMarks = marks;
+
+  const docH = document.documentElement.scrollHeight;
+  if (!marks.length || docH <= window.innerHeight + 120) {
+    rail.classList.remove("on");
+    return;
+  }
+  rail.classList.add("on");
+
+  for (const m of marks) {
+    m.y = m.el.getBoundingClientRect().top + window.scrollY;
+    const tick = el("div", "tick" + (m.closing ? " end" : ""));
+    tick.style.top = (m.y / docH * 100) + "%";
+    m.tick = tick;
+    tick.addEventListener("mouseenter", () => showRailTip(m));
+    tick.addEventListener("mouseleave", hideRailTip);
+    tick.addEventListener("click", () => {
+      window.scrollTo({top: Math.max(0, m.y - 80), behavior: "smooth"});
+    });
+    rail.appendChild(tick);
+  }
+  markRailHere();
+}
+
+function showRailTip(m) {
+  const tip = document.getElementById("rail-tip");
+  tip.innerHTML = "";
+  if (m.num !== null) {
+    const b = el("b", null, "#" + m.num);
+    tip.appendChild(b);
+    tip.appendChild(el("span", null, "  " + m.label));
+  } else {
+    tip.appendChild(el("span", null, m.label));
+  }
+  tip.appendChild(el("div", null, m.text));
+  tip.classList.add("on");
+
+  // Ghim cho vua man hinh, khong de tran ra ngoai
+  const r = m.tick.getBoundingClientRect();
+  const h = tip.offsetHeight;
+  const top = Math.max(8, Math.min(window.innerHeight - h - 8,
+                                   r.top + r.height / 2 - h / 2));
+  tip.style.top = top + "px";
+}
+
+function hideRailTip() {
+  document.getElementById("rail-tip").classList.remove("on");
+}
+
+function markRailHere() {
+  // To dam vach cua cau hoi dang o gan dau man hinh nhat
+  if (!railMarks.length) return;
+  const moc = window.scrollY + 120;
+  let chon = railMarks[0];
+  for (const m of railMarks) {
+    if (m.y <= moc) chon = m;
+  }
+  for (const m of railMarks) {
+    if (m.tick) m.tick.classList.toggle("here", m === chon);
+  }
+}
+
 function toggleJump() {
   // Trang ngan thi giau di cho do vuong.
   const canScroll =
@@ -1594,8 +1715,9 @@ async function stop() {
 
 document.getElementById("to-top").addEventListener("click", scrollToTop);
 document.getElementById("to-bottom").addEventListener("click", scrollToBottom);
-window.addEventListener("scroll", toggleJump, {passive: true});
-window.addEventListener("resize", toggleJump);
+window.addEventListener("scroll", () => { toggleJump(); markRailHere(); },
+                        {passive: true});
+window.addEventListener("resize", () => { toggleJump(); buildRail(railMarks); });
 document.getElementById("go").addEventListener("click", start);
 document.getElementById("pause").addEventListener("click", pauseShow);
 document.getElementById("stop").addEventListener("click", stop);
