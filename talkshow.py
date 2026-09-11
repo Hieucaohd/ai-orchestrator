@@ -97,7 +97,52 @@ CREATE TABLE IF NOT EXISTS prompts (
     name TEXT PRIMARY KEY,
     text TEXT
 );
+CREATE TABLE IF NOT EXISTS presets (
+    id         TEXT PRIMARY KEY,
+    name       TEXT,
+    created_at TEXT,
+    updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS preset_values (
+    preset_id TEXT,
+    name      TEXT,
+    text      TEXT,
+    PRIMARY KEY (preset_id, name)
+);
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 """
+
+# Bien dung duoc trong tung mau, kem giai thich.
+#
+# Day la danh sach CHINH XAC nhung gi run_show truyen vao P.fill() cho tung
+# mau. Viet <<TEN>> khong co trong danh sach cua mau do thi no se nam nguyen
+# xi trong prompt gui di, nen giao dien canh bao ngay.
+TEMPLATE_VARS = {
+    "MC_SETUP": [("TOPIC", "Chủ đề buổi toạ đàm bạn gõ ở đầu trang"),
+                 ("MAX", "Số ký tự tối đa cho một câu hỏi")],
+    "MC_FIRST": [],
+    "MC_NEXT": [("ANSWER", "Nguyên văn câu trả lời khách mời vừa đưa"),
+                ("TURN", "Số thứ tự lượt hiện tại"),
+                ("TOTAL", "Tổng số lượt của buổi"),
+                ("CLOSING", "Câu nhắc sắp hết giờ, ghép từ mẫu MC_NEAR_END")],
+    "MC_NEAR_END": [],
+    "MC_CLOSE": [("ANSWER", "Câu trả lời cuối cùng của khách mời")],
+    "MC_CONTINUE": [("RECAP", "Tóm tắt buổi trước (ưu tiên lời kết)"),
+                    ("DONE", "Số lượt buổi trước đã chạy"),
+                    ("FOCUS", "Khối chỉ dẫn riêng, dựng từ MC_CONTINUE_FOCUS"),
+                    ("EXTRA", "Số lượt được chạy thêm lần này")],
+    "MC_CONTINUE_FOCUS": [("NOTE", "Prompt bổ sung bạn gõ khi bấm Đào sâu thêm")],
+    "MC_FOCUS_REMINDER": [("NOTE", "Cũng là prompt bổ sung đó")],
+    "GUEST_SETUP": [("TOPIC", "Chủ đề buổi toạ đàm"),
+                    ("QUESTION", "Câu hỏi MC vừa đặt, đã cắt cho vừa ô nhập")],
+    "GUEST_NEXT": [("QUESTION", "Câu hỏi MC vừa đặt")],
+    "GUEST_RESUME": [("TOPIC", "Chủ đề buổi toạ đàm"),
+                     ("QUESTION", "Câu hỏi MC vừa đặt"),
+                     ("RECAP", "Danh sách các câu đã hỏi ở buổi trước")],
+}
 
 # Cac mau prompt cho phep sua tren giao dien. Ten trung voi bien trong
 # talkshow_prompts.py — khong co ban sua thi lay thang tu do ra.
@@ -121,6 +166,20 @@ EDITABLE_NUMBERS = [
     ("RECAP_MAX_CHARS", "Trần cho cả khối tóm tắt buổi trước"),
     ("RECAP_MAX_ANSWER", "Cắt mỗi câu trả lời cũ còn bao nhiêu, ở đường lui"),
 ]
+
+# Mau nay gui cho AI nao. Ghi ro ra giao dien de khoi phai doan qua tien to
+# MC_ / GUEST_ trong ten bien.
+#
+# Ba con so o cuoi khong phai prompt, nhung deu anh huong den noi dung gui
+# cho mot ben cu the: MAX_QUESTION cat cau hoi truoc khi sang NotebookLM,
+# hai con RECAP_* cat phan tom tat truoc khi sang ChatGPT.
+TEMPLATE_TARGET = {
+    "MC_SETUP": MC, "MC_FIRST": MC, "MC_NEXT": MC, "MC_NEAR_END": MC,
+    "MC_CLOSE": MC, "MC_CONTINUE": MC, "MC_CONTINUE_FOCUS": MC,
+    "MC_FOCUS_REMINDER": MC,
+    "GUEST_SETUP": GUEST, "GUEST_NEXT": GUEST, "GUEST_RESUME": GUEST,
+    "MAX_QUESTION": GUEST, "RECAP_MAX_CHARS": MC, "RECAP_MAX_ANSWER": MC,
+}
 
 PROMPT_OVERRIDES = {}   # ten -> noi dung da sua tren giao dien
 
@@ -267,18 +326,116 @@ def save_prompt(name: str, text: str):
             PROMPT_OVERRIDES[name] = text
 
 
+# ----------------------------------------------------- bo mau prompt co ten
+
+def get_setting(key: str, mac_dinh: str = "") -> str:
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        row = con.execute("SELECT value FROM settings WHERE key = ?",
+                          (key,)).fetchone()
+    return row[0] if row else mac_dinh
+
+
+def set_setting(key: str, value: str):
+    with closing(sqlite3.connect(DB_PATH)) as con, con:
+        con.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) "
+                    "DO UPDATE SET value = excluded.value", (key, value))
+
+
+def preset_list() -> list:
+    """Danh sach bo mau, kem bo dang dung."""
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT p.id, p.name, p.updated_at, COUNT(v.name) AS so_muc "
+            "FROM presets p LEFT JOIN preset_values v ON v.preset_id = p.id "
+            "GROUP BY p.id ORDER BY p.name COLLATE NOCASE").fetchall()
+    return {"active": get_setting("active_preset"),
+            "presets": [dict(r) for r in rows]}
+
+
+def preset_save(name: str, values: dict, preset_id: str = None) -> str:
+    """
+    Tao moi hoac ghi de mot bo mau.
+
+    Chi luu nhung muc KHAC ban goc — bo mau vi the tu bat kip khi ban sua
+    mau mac dinh trong talkshow_prompts.py, thay vi dong bang gia tri cu.
+    """
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("bo mau phai co ten")
+
+    known = {n for n, _ in EDITABLE_TEMPLATES} | {n for n, _ in EDITABLE_NUMBERS}
+    khac = {k: str(v) for k, v in values.items()
+            if k in known and str(v).strip() != str(getattr(P, k)).strip()}
+
+    now = datetime.now().isoformat(sep=" ", timespec="seconds")
+    preset_id = preset_id or uuid.uuid4().hex[:12]
+    with closing(sqlite3.connect(DB_PATH)) as con, con:
+        con.execute(
+            "INSERT INTO presets VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE "
+            "SET name = excluded.name, updated_at = excluded.updated_at",
+            (preset_id, name, now, now))
+        con.execute("DELETE FROM preset_values WHERE preset_id = ?", (preset_id,))
+        con.executemany("INSERT INTO preset_values VALUES (?,?,?)",
+                        [(preset_id, k, v) for k, v in khac.items()])
+    return preset_id
+
+
+def preset_apply(preset_id: str):
+    """Nap mot bo mau vao bo dang dung. preset_id rong = ve mau goc."""
+    if preset_id:
+        with closing(sqlite3.connect(DB_PATH)) as con:
+            if not con.execute("SELECT 1 FROM presets WHERE id = ?",
+                               (preset_id,)).fetchone():
+                raise KeyError("khong co bo mau nao voi ma nay")
+            rows = con.execute(
+                "SELECT name, text FROM preset_values WHERE preset_id = ?",
+                (preset_id,)).fetchall()
+    else:
+        rows = []
+
+    with closing(sqlite3.connect(DB_PATH)) as con, con:
+        con.execute("DELETE FROM prompts")
+        con.executemany("INSERT INTO prompts VALUES (?,?)", rows)
+    set_setting("active_preset", preset_id)
+    load_prompts()
+
+
+def preset_delete(preset_id: str):
+    with closing(sqlite3.connect(DB_PATH)) as con, con:
+        con.execute("DELETE FROM preset_values WHERE preset_id = ?", (preset_id,))
+        con.execute("DELETE FROM presets WHERE id = ?", (preset_id,))
+    if get_setting("active_preset") == preset_id:
+        set_setting("active_preset", "")
+
+
+VAR_PATTERN = re.compile(r"<<([A-Z_][A-Z0-9_]*)>>")
+
+
 def prompt_list() -> list:
-    """Toan bo mau prompt kem ban goc, de giao dien so sanh va khoi phuc."""
+    """
+    Toan bo mau prompt kem ban goc, danh sach bien dung duoc va canh bao.
+
+    "unknown" la nhung <<TEN>> co trong noi dung ma khong phai bien cua mau
+    do — chung se nam nguyen xi trong prompt gui cho AI, nen phai bao.
+    """
     out = []
     for kind, items in (("text", EDITABLE_TEMPLATES), ("number", EDITABLE_NUMBERS)):
         for name, note in items:
             default = str(getattr(P, name))
             with LOCK:
                 current = PROMPT_OVERRIDES.get(name)
-            out.append({"name": name, "note": note, "kind": kind,
-                        "default": default,
-                        "text": current if current is not None else default,
-                        "changed": current is not None})
+            text = current if current is not None else default
+            bien = TEMPLATE_VARS.get(name, [])
+            hop_le = {v for v, _ in bien}
+            out.append({
+                "name": name, "note": note, "kind": kind,
+                "target": TEMPLATE_TARGET.get(name, ""),
+                "default": default, "text": text,
+                "changed": current is not None,
+                "vars": [{"name": v, "note": n} for v, n in bien],
+                "unknown": sorted(set(VAR_PATTERN.findall(text)) - hop_le),
+            })
     return out
 
 
@@ -1040,6 +1197,11 @@ PAGE = """<!doctype html>
          border-bottom: 1px solid var(--line); }
   .tpl-head { display: flex; justify-content: space-between; align-items: baseline;
               gap: 10px; margin-bottom: 5px; }
+  .tpl-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .tpl-to { font-size: 11px; font-weight: 650; padding: 2px 8px;
+            border-radius: 20px; white-space: nowrap; }
+  .tpl-to.to-mc { background: var(--mc-bg); color: var(--mc); }
+  .tpl-to.to-guest { background: var(--guest-bg); color: var(--guest); }
   .tpl-name { font-size: 13px; font-weight: 650; font-family: ui-monospace, monospace; }
   .tpl-note { font-size: 12px; color: var(--muted); }
   .tpl.dirty .tpl-name::after { content: " (đã sửa)"; color: var(--guest);
@@ -1048,6 +1210,26 @@ PAGE = """<!doctype html>
                   font-family: ui-monospace, Consolas, monospace;
                   font-size: 12.5px; line-height: 1.5; }
   .tpl input[type=number] { width: 120px; }
+  /* thanh chon bo mau */
+  .preset-bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+                padding: 12px; margin-bottom: 18px; border-radius: 10px;
+                background: var(--card); border: 1px solid var(--line); }
+  .preset-bar label { display: flex; gap: 7px; align-items: center;
+                      font-size: 12.5px; color: var(--muted); }
+  .preset-bar select { min-width: 200px; flex: 0 1 260px; }
+  .preset-bar input[type=text] { flex: 1 1 180px; padding: 8px 10px; height: 38px;
+    border: 1px solid var(--line); border-radius: 9px;
+    background: var(--bg); color: var(--text); font: inherit; font-size: 13px; }
+  button.danger { color: var(--err); border-color: var(--err); }
+  /* cac bien dung duoc trong mau */
+  .vars { display: flex; flex-wrap: wrap; gap: 6px; margin: 7px 0 4px; }
+  .vars .v { font-family: ui-monospace, Consolas, monospace; font-size: 11.5px;
+             padding: 2px 7px; border-radius: 5px; cursor: pointer;
+             background: var(--mc-bg); color: var(--mc);
+             border: 1px solid transparent; }
+  .vars .v:hover { border-color: var(--mc); }
+  .vars .none { font-size: 11.5px; color: var(--muted); font-style: italic; }
+  .warn { margin-top: 6px; font-size: 12px; color: var(--err); }
   .sheet-actions { display: flex; gap: 10px; align-items: center;
                    position: sticky; bottom: 0; background: var(--bg);
                    padding: 12px 0 2px; border-top: 1px solid var(--line); }
@@ -1158,13 +1340,25 @@ PAGE = """<!doctype html>
 
 <div class="sheet" id="sheet">
   <div class="sheet-box">
-    <h2>Mẫu prompt</h2>
-    <div class="sub">Sửa ở đây sẽ áp dụng cho các lượt sau, lưu vào talkshow.db
-      nên còn nguyên sau khi khởi động lại. Giữ nguyên các mốc dạng
-      &lt;&lt;TÊN&gt;&gt; — chương trình thay chúng bằng nội dung thật trước khi gửi.</div>
+    <h2>Bộ mẫu prompt</h2>
+    <div class="sub">Một bộ mẫu gồm toàn bộ prompt gửi cho ChatGPT và
+      NotebookLM. Bạn có thể tạo nhiều bộ cho nhiều kiểu toạ đàm khác nhau,
+      đặt tên và chuyển qua lại. Các mốc dạng &lt;&lt;TÊN&gt;&gt; được thay
+      bằng nội dung thật trước khi gửi — bấm vào tên biến để chèn vào chỗ
+      con trỏ.</div>
+
+    <div class="preset-bar">
+      <label>Bộ đang dùng
+        <select id="preset-pick"></select>
+      </label>
+      <input type="text" id="preset-name" placeholder="Tên bộ mẫu...">
+      <button id="preset-save-as" class="small">Lưu thành bộ mới</button>
+      <button id="preset-delete" class="small danger">Xoá bộ này</button>
+    </div>
+
     <div id="tpl-list"></div>
     <div class="sheet-actions">
-      <button id="tpl-save">Lưu</button>
+      <button id="tpl-save">Lưu vào bộ đang dùng</button>
       <button id="tpl-close" class="small">Đóng</button>
       <span class="hint" id="tpl-msg"></span>
     </div>
@@ -1345,58 +1539,190 @@ async function answerReview(action, text) {
   await poll();
 }
 
-async function loadPrompts() {
-  const list = await (await fetch("/api/prompts")).json();
-  const box = document.getElementById("tpl-list");
-  box.innerHTML = "";
-  for (const p of list) {
-    const row = el("div", "tpl" + (p.changed ? " dirty" : ""));
-    const head = el("div", "tpl-head");
-    head.appendChild(el("span", "tpl-name", p.name));
-    head.appendChild(el("span", "tpl-note", p.note));
-    row.appendChild(head);
-
-    let field;
-    if (p.kind === "number") {
-      field = el("input");
-      field.type = "number";
-      field.min = 1;
-    } else {
-      field = el("textarea");
-    }
-    field.value = p.text;
-    field.dataset.name = p.name;
-    field.dataset.default = p.default;
-    row.appendChild(field);
-
-    if (p.changed) {
-      const undo = el("button", "small", "Khôi phục mẫu gốc");
-      undo.style.marginTop = "8px";
-      undo.addEventListener("click", () => {
-        field.value = field.dataset.default;
-        row.classList.remove("dirty");
-      });
-      row.appendChild(undo);
-    }
-    box.appendChild(row);
-  }
+function chenBien(field, ten) {
+  // Chen <<TEN>> vao dung cho con tro dang dung
+  const moc = "<<" + ten + ">>";
+  const a = field.selectionStart, b = field.selectionEnd;
+  if (a === null || a === undefined) { field.value += moc; return; }
+  field.value = field.value.slice(0, a) + moc + field.value.slice(b);
+  field.selectionStart = field.selectionEnd = a + moc.length;
+  field.focus();
+  field.dispatchEvent(new Event("input"));
 }
 
-async function savePrompts() {
-  const msg = document.getElementById("tpl-msg");
+function veMotMau(p) {
+  const row = el("div", "tpl" + (p.changed ? " dirty" : ""));
+  const head = el("div", "tpl-head");
+  const trai = el("span", "tpl-left");
+  if (p.target) {
+    const to = el("span",
+      "tpl-to " + (p.target === "ChatGPT" ? "to-mc" : "to-guest"),
+      p.kind === "number"
+        ? "ảnh hưởng " + p.target
+        : "gửi cho " + p.target);
+    trai.appendChild(to);
+  }
+  trai.appendChild(el("span", "tpl-name", p.name));
+  head.appendChild(trai);
+  head.appendChild(el("span", "tpl-note", p.note));
+  row.appendChild(head);
+
+  let field;
+  if (p.kind === "number") {
+    field = el("input");
+    field.type = "number";
+    field.min = 1;
+  } else {
+    field = el("textarea");
+  }
+  field.value = p.text;
+  field.dataset.name = p.name;
+  field.dataset.default = p.default;
+
+  // Bien dung duoc — bam vao thi chen vao cho con tro
+  if (p.kind === "text") {
+    const vars = el("div", "vars");
+    if (p.vars.length === 0) {
+      vars.appendChild(el("span", "none", "Mẫu này không có biến nào"));
+    } else {
+      for (const v of p.vars) {
+        const chip = el("span", "v", "<<" + v.name + ">>");
+        chip.title = v.note;
+        chip.addEventListener("click", () => chenBien(field, v.name));
+        vars.appendChild(chip);
+      }
+    }
+    row.appendChild(vars);
+  }
+
+  row.appendChild(field);
+
+  const canhBao = el("div", "warn");
+  function kiemTraBien() {
+    const hopLe = new Set((p.vars || []).map(v => v.name));
+    const dung = [...field.value.matchAll(/<<([A-Z_][A-Z0-9_]*)>>/g)]
+      .map(m => m[1]).filter(n => !hopLe.has(n));
+    const la = [...new Set(dung)];
+    canhBao.textContent = la.length
+      ? "Biến không dùng được ở mẫu này: " + la.map(n => "<<" + n + ">>").join(", ")
+        + " — sẽ nằm nguyên trong prompt gửi đi."
+      : "";
+  }
+  field.addEventListener("input", kiemTraBien);
+  kiemTraBien();
+  row.appendChild(canhBao);
+
+  if (p.changed) {
+    const undo = el("button", "small", "Khôi phục mẫu gốc");
+    undo.style.marginTop = "8px";
+    undo.addEventListener("click", () => {
+      field.value = field.dataset.default;
+      row.classList.remove("dirty");
+      kiemTraBien();
+    });
+    row.appendChild(undo);
+  }
+  return row;
+}
+
+function veDanhSachBo(data) {
+  const sel = document.getElementById("preset-pick");
+  sel.innerHTML = "";
+  const goc = el("option", null, "Mặc định (mẫu gốc trong mã nguồn)");
+  goc.value = "";
+  sel.appendChild(goc);
+  for (const b of data.presets) {
+    const o = el("option", null,
+      b.name + (b.so_muc ? "  ·  " + b.so_muc + " mục đã sửa" : "  ·  như mẫu gốc"));
+    o.value = b.id;
+    sel.appendChild(o);
+  }
+  sel.value = data.active || "";
+
+  const ten = document.getElementById("preset-name");
+  const dangDung = data.presets.find(b => b.id === data.active);
+  ten.value = dangDung ? dangDung.name : "";
+  document.getElementById("preset-delete").disabled = !dangDung;
+}
+
+async function loadPrompts() {
+  const data = await (await fetch("/api/prompts")).json();
+  const box = document.getElementById("tpl-list");
+  box.innerHTML = "";
+  for (const p of data.fields) box.appendChild(veMotMau(p));
+  veDanhSachBo(data);
+}
+
+function thuThapMau() {
   const prompts = {};
   document.querySelectorAll("#tpl-list [data-name]").forEach(f => {
     prompts[f.dataset.name] = f.value;
   });
-  msg.textContent = "Dang luu...";
+  return prompts;
+}
+
+async function goiApiMau(body, dangLam) {
+  const msg = document.getElementById("tpl-msg");
+  msg.textContent = dangLam;
   const data = await (await fetch("/api/prompts", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({prompts: prompts})
+    body: JSON.stringify(body)
   })).json();
-  if (data.error) { msg.textContent = "Loi: " + data.error; return; }
-  const n = data.filter(p => p.changed).length;
-  msg.textContent = "Da luu. " + (n ? n + " mau khac mac dinh." : "Tat ca dang la mau goc.");
-  await loadPrompts();
+  if (data.error) { msg.textContent = "Lỗi: " + data.error; return null; }
+
+  const box = document.getElementById("tpl-list");
+  box.innerHTML = "";
+  for (const p of data.fields) box.appendChild(veMotMau(p));
+  veDanhSachBo(data);
+  return data;
+}
+
+async function savePrompts() {
+  const data = await goiApiMau(
+    {action: "save", prompts: thuThapMau()}, "Đang lưu...");
+  if (!data) return;
+  const n = data.fields.filter(p => p.changed).length;
+  document.getElementById("tpl-msg").textContent =
+    "Đã lưu. " + (n ? n + " mục khác mẫu gốc." : "Tất cả đang là mẫu gốc.");
+}
+
+async function savePresetAs() {
+  const ten = document.getElementById("preset-name").value.trim();
+  if (!ten) {
+    document.getElementById("tpl-msg").textContent =
+      "Hãy đặt tên cho bộ mẫu trước khi lưu.";
+    return;
+  }
+  const data = await goiApiMau(
+    {action: "save_preset", name: ten, prompts: thuThapMau()},
+    "Đang tạo bộ mẫu...");
+  if (data) {
+    document.getElementById("tpl-msg").textContent =
+      "Đã lưu bộ mẫu “" + ten + "” và đang dùng bộ này.";
+  }
+}
+
+async function applyPreset(id) {
+  const data = await goiApiMau({action: "apply", id: id}, "Đang nạp bộ mẫu...");
+  if (data) {
+    const b = data.presets.find(x => x.id === id);
+    document.getElementById("tpl-msg").textContent = b
+      ? "Đang dùng bộ “" + b.name + "”."
+      : "Đã quay về mẫu gốc.";
+  }
+}
+
+async function deletePreset() {
+  const sel = document.getElementById("preset-pick");
+  const id = sel.value;
+  if (!id) return;
+  const ten = sel.options[sel.selectedIndex].textContent.split("  ·  ")[0];
+  if (!window.confirm("Xoá bộ mẫu “" + ten + "”?")) return;
+  const data = await goiApiMau({action: "delete", id: id}, "Đang xoá...");
+  if (data) {
+    document.getElementById("tpl-msg").textContent =
+      "Đã xoá. Bộ đang dùng quay về mẫu gốc.";
+  }
 }
 
 function extendPanel() {
@@ -1730,6 +2056,12 @@ document.getElementById("tpl-close").addEventListener("click", () => {
   document.getElementById("sheet").classList.remove("on");
 });
 document.getElementById("tpl-save").addEventListener("click", savePrompts);
+document.getElementById("preset-save-as")
+        .addEventListener("click", savePresetAs);
+document.getElementById("preset-delete")
+        .addEventListener("click", deletePreset);
+document.getElementById("preset-pick")
+        .addEventListener("change", e => applyPreset(e.target.value));
 exportPortInput.addEventListener("change", rememberExportPort);
 document.getElementById("history").addEventListener("change", e => openShow(e.target.value));
 
@@ -1799,7 +2131,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/shows":
             return self._send(200, json.dumps(list_shows(), ensure_ascii=False))
         if path == "/api/prompts":
-            return self._send(200, json.dumps(prompt_list(), ensure_ascii=False))
+            return self._send(200, json.dumps(
+                {"fields": prompt_list(), **preset_list()}, ensure_ascii=False))
         if path == "/api/status":
             job_id = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
             with LOCK:
@@ -1838,12 +2171,33 @@ class Handler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length") or 0)
             try:
                 data = json.loads(self.rfile.read(length) or b"{}")
-                for name, text in (data.get("prompts") or {}).items():
-                    save_prompt(name, text)
+                viec = data.get("action") or "save"
+                fields = data.get("prompts") or {}
+
+                if viec == "save":              # ghi vao bo dang dung
+                    for name, text in fields.items():
+                        save_prompt(name, text)
+
+                elif viec == "save_preset":     # luu thanh bo mau co ten
+                    for name, text in fields.items():
+                        save_prompt(name, text)
+                    pid = preset_save(data.get("name"), fields,
+                                      data.get("id") or None)
+                    set_setting("active_preset", pid)
+
+                elif viec == "apply":           # nap mot bo mau ra dung
+                    preset_apply(data.get("id") or "")
+
+                elif viec == "delete":
+                    preset_delete(data.get("id") or "")
+
+                else:
+                    raise ValueError(f"khong hieu action {viec!r}")
             except Exception as e:
                 return self._send(400, json.dumps({"error": str(e)},
                                                   ensure_ascii=False))
-            return self._send(200, json.dumps(prompt_list(), ensure_ascii=False))
+            return self._send(200, json.dumps(
+                {"fields": prompt_list(), **preset_list()}, ensure_ascii=False))
 
         if path == "/api/review":
             length = int(self.headers.get("Content-Length") or 0)
