@@ -348,10 +348,17 @@ class NotebookLM(Adapter):
     stop_button = "button.stop-button"
     assistant_msg = "chat-message:has(.to-user-message-inner-content)"
     reply_text = ".message-text-content"
-    # Nut Copy chi xuat hien trong message cua mo hinh sau khi response da
-    # hoan tat. NotebookLM khong gan message-id len <chat-message>, nen danh
-    # dau cac cap hoi-dap dang co truoc khi gui va doi mot cap moi co nut nay.
-    completion_button = "button.xap-copy-to-clipboard"
+    # Thanh nut o cuoi message (Luu vao ghi chu / Sao chep / thumb) chi duoc
+    # render SAU KHI response hoan tat. NotebookLM khong gan message-id len
+    # <chat-message>, nen danh dau cac cap hoi-dap dang co truoc khi gui roi
+    # doi mot cap moi co thanh nut nay.
+    #
+    # Truoc day dung "button.xap-copy-to-clipboard" nhung NotebookLM da doi
+    # giao dien: selector do khop 0 phan tu, nen khong bao gio nhan ra la da
+    # tra loi xong va ca buoi treo cho toi khi het gio. Dung the
+    # <mat-card-actions> vi no khong phu thuoc ngon ngu giao dien — aria-label
+    # cua nut Copy o day la tieng Viet ("Sao chep").
+    completion_button = "mat-card-actions.message-actions"
     reply_pair = ".chat-message-pair"
     before_marker = "data-ai-orchestrator-before"
     # Do duoc bang cach nhi phan: qua ~3900 ky tu la nut gui bi khoa cung.
