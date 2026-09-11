@@ -1051,6 +1051,16 @@ PAGE = """<!doctype html>
   .sheet-actions { display: flex; gap: 10px; align-items: center;
                    position: sticky; bottom: 0; background: var(--bg);
                    padding: 12px 0 2px; border-top: 1px solid var(--line); }
+  /* Hai nut nhay dau/cuoi trang. Chi hien khi trang du dai de cuon. */
+  .jump { position: fixed; right: 18px; bottom: 18px; z-index: 15;
+          display: none; flex-direction: column; gap: 8px; }
+  .jump.on { display: flex; }
+  .jump button { width: 42px; height: 42px; padding: 0; border-radius: 50%;
+                 font-size: 17px; line-height: 1; font-weight: 400;
+                 background: var(--card); color: var(--muted);
+                 border: 1px solid var(--line);
+                 box-shadow: 0 2px 10px rgba(0, 0, 0, .18); }
+  .jump button:hover { color: var(--mc); border-color: var(--mc); }
   .extend { margin-top: 22px; padding: 15px 16px; border-radius: 11px;
             border: 1px dashed var(--line); background: var(--card); }
   .extend-title { font-size: 14px; font-weight: 650; margin-bottom: 6px; }
@@ -1099,6 +1109,11 @@ PAGE = """<!doctype html>
   <div class="hint" id="hint"></div>
 </header>
 <main><div id="feed" class="empty">Nhập chủ đề rồi bấm Bắt đầu.</div></main>
+
+<div class="jump" id="jump">
+  <button id="to-top" title="Lên đầu trang" aria-label="Lên đầu trang">↑</button>
+  <button id="to-bottom" title="Xuống cuối trang" aria-label="Xuống cuối trang">↓</button>
+</div>
 
 <div class="sheet" id="sheet">
   <div class="sheet-box">
@@ -1218,6 +1233,8 @@ function draw(job) {
 
   // Buoi da xong -> cho noi them luot de lam ro cho con bo ngo
   if (!job.running && job.finished) feed.appendChild(extendPanel());
+
+  toggleJump();   // do dai trang vua doi, tinh lai xem con can nut cuon khong
 }
 
 function reviewPanel(rv) {
@@ -1423,6 +1440,22 @@ async function poll() {
   }
 }
 
+function toggleJump() {
+  // Trang ngan thi giau di cho do vuong.
+  const canScroll =
+    document.documentElement.scrollHeight > window.innerHeight + 120;
+  document.getElementById("jump").classList.toggle("on", canScroll);
+}
+
+function scrollToTop() {
+  window.scrollTo({top: 0, behavior: "smooth"});
+}
+
+function scrollToBottom() {
+  window.scrollTo({top: document.documentElement.scrollHeight,
+                   behavior: "smooth"});
+}
+
 async function pauseShow() {
   if (!jobId) return;
   document.getElementById("pause").disabled = true;
@@ -1559,6 +1592,10 @@ async function stop() {
   await fetch("/api/stop?id=" + jobId, {method: "POST"});
 }
 
+document.getElementById("to-top").addEventListener("click", scrollToTop);
+document.getElementById("to-bottom").addEventListener("click", scrollToBottom);
+window.addEventListener("scroll", toggleJump, {passive: true});
+window.addEventListener("resize", toggleJump);
 document.getElementById("go").addEventListener("click", start);
 document.getElementById("pause").addEventListener("click", pauseShow);
 document.getElementById("stop").addEventListener("click", stop);
@@ -1598,6 +1635,7 @@ async function initialize() {
     exportPortInput.value = view.exportPort;
     requestAnimationFrame(() => window.scrollTo(0, view.scrollY));
   }
+  toggleJump();
 }
 initialize();
 </script>
