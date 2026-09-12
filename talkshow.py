@@ -1154,7 +1154,13 @@ PAGE = """<!doctype html>
   .hint { margin-top: 10px; font-size: 12.5px; color: var(--muted); }
   .hint b { color: var(--err); font-weight: 600; }
   main { padding: 18px 22px 60px; max-width: 900px; margin: 0 auto; }
-  .turn { margin-bottom: 16px; }
+  .turn {
+    margin-bottom: 16px;
+    /* De trinh duyet bo qua bo cuc va ve cho nhung luot ngoai man hinh.
+       Buoi dai vai tram luot thi day la khac biet lon nhat khi cuon. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 420px;
+  }
   .who { font-size: 12px; font-weight: 650; margin-bottom: 5px;
          display: flex; gap: 8px; align-items: center; }
   .who .t { color: var(--muted); font-weight: 400; }
@@ -1328,7 +1334,10 @@ PAGE = """<!doctype html>
   </div>
   <div class="hint" id="hint"></div>
 </header>
-<main><div id="feed" class="empty">Nhập chủ đề rồi bấm Bắt đầu.</div></main>
+<main>
+  <div id="feed" class="empty">Nhập chủ đề rồi bấm Bắt đầu.</div>
+  <div id="feed-extra"></div>
+</main>
 
 <div class="jump" id="jump">
   <button id="to-top" title="Lên đầu trang" aria-label="Lên đầu trang">↑</button>
@@ -1373,6 +1382,8 @@ let focusDraft = "", extraDraft = 3;
 let reviewDraft = null, reviewSeq = -1;
 // Cac vach ben thanh cuon, moi vach ung voi mot cau hoi cua MC
 let railMarks = [];
+// Dau van cua tung luot da ve, de biet luot nao thuc su doi
+let dauVanCu = [], veLaiJobId = null;
 const exportPortInput = document.getElementById("export-port");
 const EXPORT_PORT_KEY = "talkshow.exportPort";
 try {
@@ -1411,12 +1422,53 @@ async function loadTabs() {
   }
 }
 
+function uocChieuCao(it) {
+  // Doan chieu cao mot luot theo so ky tu, de bao cho trinh duyet biet phai
+  // chua cho bao nhieu khi no bo qua luot nam ngoai man hinh.
+  //
+  // Doan cang sat thi thanh cuon va thanh vach cang dung. Doan bay thi
+  // thanh cuon nhay lien tuc khi cuon qua.
+  const chu = (it.text || "").length + (it.lead || "").length;
+  return Math.round(90 + Math.ceil(chu / 95) * 23);
+}
+
+function veMotLuot(it, so) {
+  const wrap = el("div", "turn " + it.role + (it.status === "error" ? " err" : ""));
+  wrap.style.containIntrinsicSize = "auto " + uocChieuCao(it) + "px";
+  const who = el("div", "who");
+  const label = it.role === "mc"
+    ? (it.turn === 0 ? "MC — lời kết" : "MC · lượt " + it.turn)
+    : "Khách mời · lượt " + it.turn;
+  if (so !== null) who.appendChild(el("span", "stt", "#" + so));
+  who.appendChild(el("span", null, label));
+  who.appendChild(el("span", "t",
+    it.status === "running" ? "đang trả lời..." :
+    (it.seconds != null ? it.seconds + "s" : "")));
+  wrap.appendChild(who);
+
+  const bubble = el("div", "bubble");
+  if (it.lead) bubble.appendChild(el("div", "lead", it.lead));
+  if (it.status === "running" && !it.text) {
+    bubble.appendChild(el("div", "waiting", "..."));
+  } else {
+    bubble.appendChild(el("div", null, it.text));
+  }
+  wrap.appendChild(bubble);
+  return wrap;
+}
+
+function dauVan(it, so) {
+  // Dau van cua mot luot. Giong nhau thi khoi dung toi the DOM cua no.
+  return [it.status, it.role, it.turn, so, it.seconds,
+          (it.text || "").length, (it.lead || "").length].join("|");
+}
+
 function draw(job) {
   const feed = document.getElementById("feed");
-  feed.className = "";
-  feed.innerHTML = "";
+  const extra = document.getElementById("feed-extra");
   document.getElementById("export").disabled = exporting ||
     !job.items.some(it => it.status === "done" && (it.text || "").trim());
+
   // Cho duyet prompt xay ra TRUOC khi them luot vao bien ban, nen o luot dau
   // tien items van rong. Neu thoat som o day thi bang duyet khong bao gio
   // hien ra, va buoi dung im mai vi khong ai bam Gui duoc.
@@ -1424,46 +1476,63 @@ function draw(job) {
   if (job.items.length === 0 && !cho_duyet) {
     feed.className = "empty";
     feed.textContent = "Dang cho MC mo dau...";
+    extra.innerHTML = "";
+    veLaiJobId = null; dauVanCu = [];
     return;
   }
+
+  // Doi buoi khac -> lam lai tu dau. Cung buoi -> chi dung toi luot nao doi.
+  //
+  // Truoc day ham nay xoa sach roi dung lai ca bien ban moi lan poll: voi
+  // buoi 398 luot la 2987 the DOM, ton ~150ms moi 0,9 giay nen giat ro ret.
+  const doiBuoi = veLaiJobId !== jobId;
+  if (doiBuoi) {
+    feed.innerHTML = "";
+    dauVanCu = [];
+    veLaiJobId = jobId;
+  }
+  feed.className = "";
+
   // Danh so y het ham exportable() ben server: chi luot da xong va co chu.
   // Nho vay con so tren man hinh dung bang con so go vao o "xuat tu ... den".
   let stt = 0;
+  const dauVanMoi = [];
   const marks = [];          // moi cau hoi cua MC -> mot vach ben thanh cuon
-  for (const it of job.items) {
+
+  for (let i = 0; i < job.items.length; i++) {
+    const it = job.items[i];
     const so = (it.status === "done" && (it.text || "").trim()) ? ++stt : null;
+    const sig = dauVan(it, so);
+    dauVanMoi.push(sig);
 
-    const wrap = el("div", "turn " + it.role + (it.status === "error" ? " err" : ""));
-    const who = el("div", "who");
-    const label = it.role === "mc"
-      ? (it.turn === 0 ? "MC — lời kết" : "MC · lượt " + it.turn)
-      : "Khách mời · lượt " + it.turn;
-    if (so !== null) who.appendChild(el("span", "stt", "#" + so));
-    who.appendChild(el("span", null, label));
-    who.appendChild(el("span", "t",
-      it.status === "running" ? "đang trả lời..." :
-      (it.seconds != null ? it.seconds + "s" : "")));
-    wrap.appendChild(who);
-
-    const bubble = el("div", "bubble");
-    if (it.lead) bubble.appendChild(el("div", "lead", it.lead));
-    if (it.status === "running" && !it.text) {
-      bubble.appendChild(el("div", "waiting", "..."));
-    } else {
-      bubble.appendChild(el("div", null, it.text));
+    let node = feed.children[i];
+    if (!node) {
+      node = veMotLuot(it, so);
+      feed.appendChild(node);
+    } else if (dauVanCu[i] !== sig) {
+      const moi = veMotLuot(it, so);
+      feed.replaceChild(moi, node);
+      node = moi;
     }
-    wrap.appendChild(bubble);
-    feed.appendChild(wrap);
 
     // Chi cau hoi cua MC moi co vach — khach moi tra loi ngay duoi do
     if (it.role === "mc" && (it.text || "").trim()) {
       marks.push({
-        el: wrap, num: so, closing: it.turn === 0,
+        el: node, num: so, closing: it.turn === 0,
         label: it.turn === 0 ? "Lời kết" : "Lượt " + it.turn,
         text: it.text.trim().slice(0, 300),
       });
     }
   }
+
+  // Bo luot thua (xay ra khi bam Thu lai: luot hong bi go di)
+  while (feed.children.length > job.items.length) {
+    feed.removeChild(feed.lastChild);
+  }
+  dauVanCu = dauVanMoi;
+
+  // Cac bang phu nam o vung rieng, doi chung khong dung toi bien ban
+  extra.innerHTML = "";
 
   // Buoi con do dang -> nut chay tiep tu dung cho hong, khong lam lai ca buoi
   if (!job.running && !job.finished) {
@@ -1472,17 +1541,21 @@ function draw(job) {
     const btn = el("button", "retry",
       failed ? "Thử lại lượt này" : "Chạy tiếp buổi này");
     btn.addEventListener("click", retry);
-    feed.appendChild(btn);
+    extra.appendChild(btn);
   }
 
   // Dang cho nguoi duyet prompt truoc khi gui
-  if (job.running && job.review) feed.appendChild(reviewPanel(job.review));
+  if (job.running && job.review) extra.appendChild(reviewPanel(job.review));
 
   // Buoi da xong -> cho noi them luot de lam ro cho con bo ngo
-  if (!job.running && job.finished) feed.appendChild(extendPanel());
+  if (!job.running && job.finished) extra.appendChild(extendPanel());
 
   toggleJump();   // do dai trang vua doi, tinh lai xem con can nut cuon khong
-  buildRail(marks);
+
+  // Dung lai thanh vach ton kem (phai do vi tri tung luot) nen chi lam khi
+  // so vach doi, khong lam moi lan poll. Doi buoi thi bat buoc phai dung
+  // lai: so vach co the trung nhau nhung cac the DOM da khac het.
+  if (doiBuoi || marks.length !== railMarks.length) buildRail(marks);
 }
 
 function reviewPanel(rv) {
@@ -1797,7 +1870,7 @@ async function poll() {
   // draw() tao lai toan bo the trong feed, ke ca o nhap prompt; vua go vua
   // bi tao lai thi mat focus va con tro nhay ve dau, khong sua noi.
   // Trong luc cho duyet server dang dung han nen cung chang co gi moi de ve.
-  const shown = document.querySelector("#feed .review");
+  const shown = document.querySelector("#feed-extra .review");
   if (shown && job.review && Number(shown.dataset.seq) === job.review.seq) return;
 
   draw(job);
@@ -1842,7 +1915,11 @@ function buildRail(marks) {
     tick.addEventListener("mouseenter", () => showRailTip(m));
     tick.addEventListener("mouseleave", hideRailTip);
     tick.addEventListener("click", () => {
-      window.scrollTo({top: Math.max(0, m.y - 80), behavior: "smooth"});
+      // Do lai vi tri ngay luc bam chu khong dung so cu: trang cao dan khi
+      // cuon qua (content-visibility), nen toa do luu tu luc dung vach co
+      // the da lech.
+      const y = m.el.getBoundingClientRect().top + window.scrollY;
+      window.scrollTo({top: Math.max(0, y - 80), behavior: "smooth"});
     });
     rail.appendChild(tick);
   }
@@ -1901,6 +1978,18 @@ function scrollToTop() {
 function scrollToBottom() {
   window.scrollTo({top: document.documentElement.scrollHeight,
                    behavior: "smooth"});
+  // Trang CAO DAN trong luc cuon: content-visibility chi doan kich thuoc cho
+  // cac luot ngoai man hinh, cuon qua toi dau trinh duyet do that toi do.
+  // Vi vay dich tinh luc bam bi hut, phai chinh lai cho cham day that su.
+  let lan = 0;
+  const chinh = () => {
+    const day = document.documentElement.scrollHeight - window.innerHeight;
+    if (window.scrollY < day - 4 && ++lan < 15) {
+      window.scrollTo({top: day});
+      setTimeout(chinh, 120);
+    }
+  };
+  setTimeout(chinh, 500);
 }
 
 async function pauseShow() {
