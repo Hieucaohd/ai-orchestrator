@@ -1324,11 +1324,13 @@ PAGE = """<!doctype html>
     </label>
     <label class="export-port">Xuất từ
       <input type="number" id="export-from" min="1" step="1"
-             inputmode="numeric" placeholder="đầu">
+             inputmode="numeric" placeholder="đầu"
+             title="Số thứ tự lượt bắt đầu — để trống là từ đầu">
     </label>
     <label class="export-port">đến
       <input type="number" id="export-to" min="1" step="1"
-             inputmode="numeric" placeholder="cuối">
+             inputmode="numeric" placeholder="cuối"
+             title="Số thứ tự lượt kết thúc — để trống là tới cuối">
     </label>
     <button id="export" class="small" disabled>Xuất hội thoại</button>
   </div>
@@ -1384,6 +1386,8 @@ let reviewDraft = null, reviewSeq = -1;
 let railMarks = [];
 // Dau van cua tung luot da ve, de biet luot nao thuc su doi
 let dauVanCu = [], veLaiJobId = null;
+// Con tu dien khoang xuat ho khong, hay nguoi dung da tu go
+let xuatTuDong = true;
 const exportPortInput = document.getElementById("export-port");
 const EXPORT_PORT_KEY = "talkshow.exportPort";
 try {
@@ -1530,6 +1534,7 @@ function draw(job) {
     feed.removeChild(feed.lastChild);
   }
   dauVanCu = dauVanMoi;
+  capNhatKhoangXuat(stt);
 
   // Cac bang phu nam o vung rieng, doi chung khong dung toi bien ban
   extra.innerHTML = "";
@@ -1964,6 +1969,18 @@ function markRailHere() {
   }
 }
 
+function capNhatKhoangXuat(tong) {
+  // Mac dinh dien san ca khoang (1 -> het), de bam Xuat la ra toan bo.
+  // Nguoi dung sua tay mot lan thi thoi khong tu dong nua, keo mat cai ho
+  // vua go — ke ca khi buoi dang chay va so luot van tang dan.
+  if (!xuatTuDong) return;
+  const tu = document.getElementById("export-from");
+  const den = document.getElementById("export-to");
+  tu.value = tong ? 1 : "";
+  den.value = tong || "";
+  tu.max = den.max = tong || "";
+}
+
 function toggleJump() {
   // Trang ngan thi giau di cho do vuong.
   const canScroll =
@@ -2073,6 +2090,7 @@ async function loadHistory() {
 async function openShow(id) {
   if (!id) return;
   if (timer) { clearInterval(timer); timer = null; }
+  xuatTuDong = true;          // buoi khac thi dien lai ca khoang
   const response = await fetch("/api/status?id=" + id);
   if (!response.ok) return;
   const job = await response.json();
@@ -2103,6 +2121,7 @@ async function start() {
   document.getElementById("pause").disabled = false;
   document.getElementById("stop").disabled = false;
   document.getElementById("hint").textContent = "Dang chay...";
+  xuatTuDong = true;
 
   const res = await fetch("/api/start", {
     method: "POST", headers: {"Content-Type": "application/json"},
@@ -2137,6 +2156,9 @@ document.getElementById("go").addEventListener("click", start);
 document.getElementById("pause").addEventListener("click", pauseShow);
 document.getElementById("stop").addEventListener("click", stop);
 document.getElementById("export").addEventListener("click", exportShow);
+["export-from", "export-to"].forEach(id =>
+  document.getElementById(id).addEventListener(
+    "input", () => { xuatTuDong = false; }));
 document.getElementById("open-prompts").addEventListener("click", async () => {
   await loadPrompts();
   document.getElementById("sheet").classList.add("on");
