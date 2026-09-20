@@ -25,6 +25,37 @@ START_WAIT_MS = 30000
 QUIET_MS = 2500
 
 
+# Chan tam cac ham chep cua trang web, de lay duoc thu ma nut Copy dinh dua
+# ra ma KHONG dong toi clipboard that cua may. Khong goi lai ham goc, nen
+# thu nguoi dung dang giu trong clipboard van nguyen.
+COPY_HOOK = """() => {
+  window.__orchCopy = [];
+  const c = navigator.clipboard;
+  window.__orchGoc = {wt: c.writeText, w: c.write};
+  c.writeText = async (t) => { window.__orchCopy.push({k: 'text/plain', t: t}); };
+  c.write = async (items) => {
+    for (const it of items) for (const k of it.types) {
+      try { window.__orchCopy.push({k: k, t: await (await it.getType(k)).text()}); }
+      catch (e) { /* dinh dang nao doc khong duoc thi bo qua */ }
+    }
+  };
+  window.__orchNghe = (e) => {
+    if (e.clipboardData) for (const k of e.clipboardData.types || [])
+      window.__orchCopy.push({k: k, t: e.clipboardData.getData(k)});
+  };
+  document.addEventListener('copy', window.__orchNghe, true);
+}"""
+
+COPY_UNHOOK = """() => {
+  const c = navigator.clipboard;
+  if (window.__orchGoc) { c.writeText = window.__orchGoc.wt; c.write = window.__orchGoc.w; }
+  document.removeEventListener('copy', window.__orchNghe, true);
+  const ra = window.__orchCopy || [];
+  window.__orchCopy = null; window.__orchGoc = null;
+  return ra;
+}"""
+
+
 class Adapter:
     """Khuon chung cho moi chatbot."""
 
@@ -153,6 +184,33 @@ class Adapter:
             await asyncio.sleep(0.3)
         raise RuntimeError(
             f"{self.name}: cau tra loi van chay sau {timeout_s}s, khong dung yen.")
+
+    async def copy_markdown(self, page: Page, nut) -> str:
+        """
+        Lay response duoi dang MARKDOWN bang chinh nut Copy cua trang web.
+
+        Doc bang inner_text() chi ra chu da render: mat het dau thang tieu de,
+        dam, gach dau dong, bang, khoi code. Nut Copy thi dua ra markdown goc
+        — ca ChatGPT lan NotebookLM deu chep qua navigator.clipboard.write()
+        voi mot ban 'text/plain' chinh la markdown.
+
+        Tra ve "" neu khong lay duoc, de cho goi lui ve cach doc cu.
+        """
+        if nut is None:
+            return ""
+        await page.evaluate(COPY_HOOK)
+        try:
+            await nut.click(timeout=8000)
+            await asyncio.sleep(0.6)      # cho trang kip goi ham chep
+        except Exception:
+            pass                          # bam khong duoc thi coi nhu khong lay duoc
+        finally:
+            bat = await page.evaluate(COPY_UNHOOK)
+
+        for m in bat or []:
+            if m.get("k") == "text/plain" and (m.get("t") or "").strip():
+                return m["t"].strip()
+        return ""
 
     def clean(self, text: str) -> str:
         """Don rac trong text doc duoc. Mac dinh chi cat khoang trang."""
@@ -287,13 +345,28 @@ class ChatGPT(Adapter):
 
     async def _read_reply_by_id(self, page: Page, reply_id: str) -> str:
         """Doc dung response vua hoan tat, khong mac dinh lay node cuoi."""
-        message = page.locator(
-            f'{self.assistant_msg}[data-message-id="{reply_id}"]'
-        ).first
+        sel = f'{self.assistant_msg}[data-message-id="{reply_id}"]'
+        message = page.locator(sel).first
         if await message.count() == 0:
             raise RuntimeError(
                 "ChatGPT: response moi da bien mat khoi DOM truoc khi doc duoc."
             )
+
+        # Uu tien nut Copy vi no cho ra markdown. Thanh nut chi bam duoc khi
+        # da re chuot vao dung luot do.
+        turn = page.locator(f"{self.turn_container}:has({sel})").first
+        if await turn.count() > 0:
+            try:
+                await turn.scroll_into_view_if_needed(timeout=5000)
+                await turn.hover(timeout=5000)
+            except Exception:
+                pass
+            md = await self.copy_markdown(
+                page, turn.locator(self.completion_button).first)
+            if md:
+                return md
+
+        # Lui ve doc chu da render — mat markdown nhung con hon khong co gi
         body = message.locator(self.reply_text)
         if await body.count() > 0:
             return self.clean(await body.first.inner_text())
@@ -431,8 +504,28 @@ class NotebookLM(Adapter):
             raise RuntimeError("NotebookLM: khong xac dinh duoc response moi.")
         return message
 
-    async def _read_message_handle(self, message) -> str:
-        """Doc response tu dung ElementHandle vua co nut Copy."""
+    async def _read_message_handle(self, message, page: Page = None) -> str:
+        """Doc response tu dung ElementHandle vua co thanh nut."""
+        # Uu tien nut Copy vi no cho ra markdown. Tim theo ten icon 'copy_all'
+        # chu khong theo aria-label: aria-label o day la tieng Viet
+        # ("Sao chep cau tra loi..."), doi ngon ngu giao dien la hong.
+        if page is not None:
+            nut = await message.evaluate_handle("""(el) => {
+                return [...el.querySelectorAll('button')].find(b => {
+                  const i = b.querySelector('mat-icon');
+                  return i && i.textContent.trim() === 'copy_all';
+                }) || null;
+            }""")
+            md = await self.copy_markdown(page, nut.as_element())
+            if md:
+                # KHONG goi clean() o day. clean() sinh ra de loc rac cua
+                # innerText (so thu tu trich dan, ten icon) va no NOI MOI DONG
+                # BANG DAU CACH — lam vay la pha nat markdown: tieu de, gach
+                # dau dong, ngat doan deu mat. Ban tu nut Copy von da sach,
+                # da do: 0 dong rac, con nguyen 4 tieu de va 19 gach dau dong.
+                return md.strip()
+
+        # Lui ve doc chu da render — mat markdown nhung con hon khong co gi
         paras = await message.query_selector_all(
             ".message-text-content .paragraph")
         if paras:
@@ -454,7 +547,7 @@ class NotebookLM(Adapter):
         token = await self._mark_existing_pairs(page)
         await self.send(page, text)
         message = await self._wait_completed_message(page, token, timeout_s)
-        return await self._read_message_handle(message)
+        return await self._read_message_handle(message, page)
 
     async def read_last(self, page: Page) -> str:
         """Ghep tung doan van de bo duoc phan Thoughts o dau bong bong."""

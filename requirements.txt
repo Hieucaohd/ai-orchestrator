@@ -1,0 +1,8 @@
+# Cai bang:  venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Dieu khien Chrome dang dang nhap qua CDP (step*.py, adapters.py)
+playwright==1.62.0
+
+# Sinh ma QR cho link chia se trong talkshow.py. Thuan Python, khong keo
+# theo thu vien nao khac.
+segno==1.6.6

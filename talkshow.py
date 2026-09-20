@@ -26,9 +26,12 @@ if __name__ == "__main__":
     launch(__file__)
 
 import asyncio
+import io
 import json
 import os
 import re
+import secrets
+import socket
 import sqlite3
 import threading
 import time
@@ -42,10 +45,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+import segno
+
 import adapters
 import dev_reload
 import talkshow_prompts as P
 
+# Bind ra ca mang noi bo de dien thoai xem duoc bien ban qua link chia se.
+# An toan nho Handler.tu_choi_xa(): may khac chi mo duoc /s/<token>.
+HOST = "0.0.0.0"
 PORT = 8001
 LOG_DIR = Path(__file__).parent / "logs"
 DB_PATH = Path(__file__).parent / "talkshow.db"
@@ -113,7 +121,19 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS shares (
+    show_id     TEXT PRIMARY KEY,
+    token       TEXT UNIQUE,
+    created_at  TEXT,
+    can_control INTEGER DEFAULT 0
+);
 """
+
+# Cot them vao sau khi bang da ton tai. CREATE TABLE IF NOT EXISTS khong bo
+# sung cot cho bang cu, nen phai ALTER tay.
+MIGRATIONS = [
+    ("shares", "can_control", "INTEGER DEFAULT 0"),
+]
 
 # Bien dung duoc trong tung mau, kem giai thich.
 #
@@ -192,6 +212,11 @@ def db_init():
     # chu KHONG dong file — de vay se ro ri file handle sau moi lan ghi.
     with closing(sqlite3.connect(DB_PATH)) as con, con:
         con.executescript(SCHEMA)
+        for bang, cot, kieu in MIGRATIONS:
+            co = {r[1] for r in con.execute(f"PRAGMA table_info({bang})")}
+            if cot not in co:
+                con.execute(f"ALTER TABLE {bang} ADD COLUMN {cot} {kieu}")
+                print(f"[db] da them cot {bang}.{cot}")
 
 
 def save_job(job_id: str):
@@ -324,6 +349,87 @@ def save_prompt(name: str, text: str):
         PROMPT_OVERRIDES.pop(name, None)
         if not same:
             PROMPT_OVERRIDES[name] = text
+
+
+# --------------------------------------------- chia se qua mang noi bo (LAN)
+
+def lan_ip() -> str:
+    """
+    Dia chi cua may trong mang noi bo, de dung lam link chia se.
+
+    Mo mot socket UDP roi doc dia chi cua chinh no — khong he gui goi tin nao
+    di, chi de he dieu hanh chon giup card mang dang dung.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+# Nhung viec ma thiet bi khac duoc lam khi link chia se da bat quyen dieu
+# khien. Co y KHONG cho: bat dau buoi moi, sua mau prompt, xuat du lieu, xem
+# danh sach cac buoi khac — nhung thu do chi lam tu may nay.
+SHARE_ACTIONS = {"extend", "retry", "pause", "stop", "review"}
+
+
+def share_info(show_id: str) -> dict:
+    """Ma chia se cua mot buoi kem quyen dieu khien. Chua co thi tao moi."""
+    with LOCK:
+        if show_id not in JOBS:
+            raise KeyError("khong co buoi toa dam nao voi ma nay")
+
+    with closing(sqlite3.connect(DB_PATH)) as con, con:
+        row = con.execute(
+            "SELECT token, can_control FROM shares WHERE show_id = ?",
+            (show_id,)).fetchone()
+        if row:
+            return {"token": row[0], "control": bool(row[1])}
+        token = secrets.token_urlsafe(16)
+        con.execute("INSERT INTO shares VALUES (?,?,?,0)",
+                    (show_id, token,
+                     datetime.now().isoformat(sep=" ", timespec="seconds")))
+    return {"token": token, "control": False}
+
+
+def set_share_control(show_id: str, on: bool):
+    with closing(sqlite3.connect(DB_PATH)) as con, con:
+        con.execute("UPDATE shares SET can_control = ? WHERE show_id = ?",
+                    (1 if on else 0, show_id))
+
+
+def share_by_token(token: str):
+    """Tra ve (show_id, duoc_dieu_khien) hoac (None, False)."""
+    if not token:
+        return None, False
+    with closing(sqlite3.connect(DB_PATH)) as con:
+        row = con.execute(
+            "SELECT show_id, can_control FROM shares WHERE token = ?",
+            (token,)).fetchone()
+    return (row[0], bool(row[1])) if row else (None, False)
+
+
+def show_by_token(token: str):
+    return share_by_token(token)[0]
+
+
+def qr_svg(data: str) -> str:
+    """
+    Ma QR dang SVG, nhet thang vao trang duoc.
+
+    xmldecl=False de bo khai bao <?xml?> (khong hop le giua HTML), nhung
+    svgns=True de GIU lai xmlns. Thieu xmlns thi nhet vao innerHTML van chay,
+    nhung luu ra file hay dung lam <img src="data:image/svg+xml..."> thi
+    trinh duyet tu choi giai ma.
+    """
+    buf = io.BytesIO()
+    segno.make(data, error="m").save(
+        buf, kind="svg", scale=5, border=2, dark="#111", light="#fff",
+        xmldecl=False, svgns=True, nl=False)
+    return buf.getvalue().decode("utf-8")
 
 
 # ----------------------------------------------------- bo mau prompt co ten
@@ -1171,6 +1277,25 @@ PAGE = """<!doctype html>
   .guest .who { color: var(--guest); }
   .bubble { padding: 12px 15px; border-radius: 11px; white-space: pre-wrap;
             word-wrap: break-word; border: 1px solid var(--line); }
+  /* Phan da render tu markdown: tu xuong dong bang the, khong dung pre-wrap */
+  .bubble .md { white-space: normal; }
+  .md > :first-child { margin-top: 0; }
+  .md > :last-child { margin-bottom: 0; }
+  .md p { margin: 0 0 10px; }
+  .md h3, .md h4, .md h5, .md h6 { margin: 16px 0 8px; line-height: 1.35; }
+  .md h3 { font-size: 16px; } .md h4 { font-size: 15px; }
+  .md h5, .md h6 { font-size: 14px; }
+  .md ul, .md ol { margin: 0 0 10px; padding-left: 22px; }
+  .md li { margin: 3px 0; }
+  .md code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px;
+             background: var(--line); padding: 1px 5px; border-radius: 4px; }
+  .md pre { background: var(--line); padding: 10px 12px; border-radius: 8px;
+            overflow-x: auto; margin: 0 0 10px; }
+  .md pre code { background: none; padding: 0; }
+  .md blockquote { margin: 0 0 10px; padding: 2px 0 2px 12px;
+                   border-left: 3px solid var(--line); color: var(--muted); }
+  .md hr { border: 0; border-top: 1px solid var(--line); margin: 14px 0; }
+  .md a { color: var(--mc); }
   .mc .bubble { background: var(--mc-bg); }
   .guest .bubble { background: var(--guest-bg); margin-left: 28px; }
   .lead { font-style: italic; color: var(--muted); margin-bottom: 8px;
@@ -1180,6 +1305,25 @@ PAGE = """<!doctype html>
   button.small { height: 38px; padding: 0 16px; font-size: 13px;
                  background: transparent; color: var(--guest);
                  border: 1px solid var(--guest); }
+  /* bang chia se kem ma QR */
+  .share-box { display: flex; gap: 16px; align-items: flex-start; margin-top: 12px;
+               padding: 14px; border-radius: 11px; background: var(--card);
+               border: 1px solid var(--line); }
+  .share-qr svg { display: block; width: 168px; height: 168px;
+                  border-radius: 6px; background: #fff; }
+  .share-info { flex: 1; min-width: 0; }
+  .share-title { font-size: 13px; font-weight: 650; margin-bottom: 9px; }
+  .share-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  #share-url { flex: 1 1 260px; padding: 8px 10px; height: 38px;
+    border: 1px solid var(--line); border-radius: 9px; background: var(--bg);
+    color: var(--text); font-family: ui-monospace, Consolas, monospace;
+    font-size: 12.5px; }
+  .share-note { margin-top: 10px; font-size: 12px; color: var(--muted);
+                line-height: 1.55; }
+  .share-note b { color: var(--text); }
+  /* che do chi-xem: an het cac thu dieu khien */
+  body.chi-xem header .row, body.chi-xem #share-box { display: none; }
+  body.chi-xem header { padding-bottom: 14px; }
   label.chk { display: flex; gap: 7px; align-items: center; font-size: 13px;
               color: var(--muted); cursor: pointer; height: 38px; }
   /* bang duyet prompt truoc khi gui */
@@ -1333,6 +1477,26 @@ PAGE = """<!doctype html>
              title="Số thứ tự lượt kết thúc — để trống là tới cuối">
     </label>
     <button id="export" class="small" disabled>Xuất hội thoại</button>
+    <button id="share" class="small" disabled>Chia sẻ</button>
+  </div>
+  <div class="share-box" id="share-box" hidden>
+    <div class="share-qr" id="share-qr"></div>
+    <div class="share-info">
+      <div class="share-title">Quét mã hoặc mở link này trên thiết bị cùng mạng Wi-Fi</div>
+      <div class="share-row">
+        <input type="text" id="share-url" readonly>
+        <button id="share-copy" class="small">Sao chép link</button>
+        <button id="share-close" class="small">Đóng</button>
+      </div>
+      <label class="chk" style="margin-top:10px">
+        <input type="checkbox" id="share-control">
+        Cho phép bấm “Đào sâu thêm”, “Chạy tiếp”, “Tạm dừng”, “Dừng hẳn” từ link này
+      </label>
+      <div class="share-note">Mặc định link <b>chỉ để xem</b>. Dù có bật quyền
+        trên, người mở link vẫn <b>không</b> bắt đầu được buổi mới, không sửa
+        được mẫu prompt và không xuất được dữ liệu. Link chỉ dùng được khi máy
+        này vẫn đang chạy server.</div>
+    </div>
   </div>
   <div class="hint" id="hint"></div>
 </header>
@@ -1377,6 +1541,8 @@ PAGE = """<!doctype html>
 </div>
 
 <script>
+// Server chen vao: null = giao dien dieu khien, {token} = che do chi-xem
+const CHIASE = "__SHARE_CFG__";
 let timer = null, jobId = null, exporting = false;
 // Giu lai nhung gi da go o bang "Dao sau them", vi draw() ve lai ca feed
 let focusDraft = "", extraDraft = 3;
@@ -1386,6 +1552,14 @@ let reviewDraft = null, reviewSeq = -1;
 let railMarks = [];
 // Dau van cua tung luot da ve, de biet luot nao thuc su doi
 let dauVanCu = [], veLaiJobId = null;
+
+// Cung mot nut, hai duong: tren may nay goi /api/..., con mo qua link
+// chia se thi goi /s/<token>/... — ma buoi lay tu token nen khong tro
+// sang buoi khac duoc.
+function duongDan(viec) {
+  return CHIASE ? "/s/" + CHIASE.token + "/" + viec
+                : "/api/" + viec + "?id=" + jobId;
+}
 // Con tu dien khoang xuat ho khong, hay nguoi dung da tu go
 let xuatTuDong = true;
 const exportPortInput = document.getElementById("export-port");
@@ -1426,6 +1600,77 @@ async function loadTabs() {
   }
 }
 
+function thoatHtml(s) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function veMarkdown(src) {
+  // Render markdown ra HTML. Cac AI gio tra ve markdown that (lay qua nut
+  // Copy cua chinh trang web), neu in tho thi day dau ** va # rat kho doc.
+  //
+  // Thoat HTML TRUOC roi moi bien doi, nen noi dung do AI sinh ra khong the
+  // chen the vao trang.
+  const khoiCode = [];
+  let t = thoatHtml(src).replace(/```([\\s\\S]*?)```/g, (m, code) => {
+    khoiCode.push(code.replace(/^[a-zA-Z0-9]*\\n/, ""));
+    return "\\u0000CODE" + (khoiCode.length - 1) + "\\u0000";
+  });
+
+  const ra = [];
+  let dsThuong = null, dsSo = null;
+
+  const dongDs = () => {
+    if (dsThuong) { ra.push("<ul>" + dsThuong.join("") + "</ul>"); dsThuong = null; }
+    if (dsSo) { ra.push("<ol>" + dsSo.join("") + "</ol>"); dsSo = null; }
+  };
+
+  const trongDong = (s) => s
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\\*\\*([^*]+)\\*\\*/g, "<strong>$1</strong>")
+    .replace(/(^|[^*])\\*([^*\\n]+)\\*/g, "$1<em>$2</em>")
+    .replace(/\\[([^\\]]+)\\]\\((https?:[^)\\s]+)\\)/g,
+             '<a href="$2" target="_blank" rel="noopener">$1</a>');
+
+  for (const dong of t.split("\\n")) {
+    const d = dong.trim();
+
+    const md = d.match(/^\\u0000CODE(\\d+)\\u0000$/);
+    if (md) { dongDs(); ra.push("<pre><code>" + khoiCode[+md[1]] + "</code></pre>"); continue; }
+
+    if (!d) { dongDs(); continue; }
+
+    const h = d.match(/^(#{1,6})\\s+(.*)$/);
+    if (h) {
+      dongDs();
+      const c = Math.min(h[1].length + 2, 6);
+      ra.push("<h" + c + ">" + trongDong(h[2]) + "</h" + c + ">");
+      continue;
+    }
+    if (/^(-{3,}|\\*{3,})$/.test(d)) { dongDs(); ra.push("<hr>"); continue; }
+    if (d.startsWith("&gt; ")) {
+      dongDs();
+      ra.push("<blockquote>" + trongDong(d.slice(5)) + "</blockquote>");
+      continue;
+    }
+    const g = d.match(/^[-*]\\s+(.*)$/);
+    if (g) {
+      if (dsSo) dongDs();
+      (dsThuong = dsThuong || []).push("<li>" + trongDong(g[1]) + "</li>");
+      continue;
+    }
+    const s = d.match(/^\\d+[.)]\\s+(.*)$/);
+    if (s) {
+      if (dsThuong) dongDs();
+      (dsSo = dsSo || []).push("<li>" + trongDong(s[1]) + "</li>");
+      continue;
+    }
+    dongDs();
+    ra.push("<p>" + trongDong(d) + "</p>");
+  }
+  dongDs();
+  return ra.join("");
+}
+
 function uocChieuCao(it) {
   // Doan chieu cao mot luot theo so ky tu, de bao cho trinh duyet biet phai
   // chua cho bao nhieu khi no bo qua luot nam ngoai man hinh.
@@ -1455,7 +1700,9 @@ function veMotLuot(it, so) {
   if (it.status === "running" && !it.text) {
     bubble.appendChild(el("div", "waiting", "..."));
   } else {
-    bubble.appendChild(el("div", null, it.text));
+    const noi = el("div", "md");
+    noi.innerHTML = veMarkdown(it.text || "");
+    bubble.appendChild(noi);
   }
   wrap.appendChild(bubble);
   return wrap;
@@ -1472,6 +1719,7 @@ function draw(job) {
   const extra = document.getElementById("feed-extra");
   document.getElementById("export").disabled = exporting ||
     !job.items.some(it => it.status === "done" && (it.text || "").trim());
+  document.getElementById("share").disabled = !jobId;
 
   // Cho duyet prompt xay ra TRUOC khi them luot vao bien ban, nen o luot dau
   // tien items van rong. Neu thoat som o day thi bang duyet khong bao gio
@@ -1539,8 +1787,12 @@ function draw(job) {
   // Cac bang phu nam o vung rieng, doi chung khong dung toi bien ban
   extra.innerHTML = "";
 
+  // Mo qua link chia se ma chua bat quyen thi khong ve nut dieu khien nao:
+  // truoc day van ve, bam vao thi server tra 403 — mot cai nut hong.
+  const choDieuKhien = !CHIASE || CHIASE.control;
+
   // Buoi con do dang -> nut chay tiep tu dung cho hong, khong lam lai ca buoi
-  if (!job.running && !job.finished) {
+  if (choDieuKhien && !job.running && !job.finished) {
     const last = job.items[job.items.length - 1];
     const failed = last && last.status === "error";
     const btn = el("button", "retry",
@@ -1550,10 +1802,12 @@ function draw(job) {
   }
 
   // Dang cho nguoi duyet prompt truoc khi gui
-  if (job.running && job.review) extra.appendChild(reviewPanel(job.review));
+  if (choDieuKhien && job.running && job.review)
+    extra.appendChild(reviewPanel(job.review));
 
   // Buoi da xong -> cho noi them luot de lam ro cho con bo ngo
-  if (!job.running && job.finished) extra.appendChild(extendPanel());
+  if (choDieuKhien && !job.running && job.finished)
+    extra.appendChild(extendPanel());
 
   toggleJump();   // do dai trang vua doi, tinh lai xem con can nut cuon khong
 
@@ -1605,7 +1859,7 @@ function reviewPanel(rv) {
 }
 
 async function answerReview(action, text) {
-  const data = await (await fetch("/api/review", {
+  const data = await (await fetch(duongDan("review"), {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({id: jobId, action: action, text: text})
   })).json();
@@ -1848,7 +2102,7 @@ async function extendShow() {
   const hint = document.getElementById("hint");
   const extra = parseInt(document.getElementById("extraTurns").value, 10) || 3;
   hint.textContent = "Dang chay tiep de dao sau...";
-  const data = await (await fetch("/api/extend", {
+  const data = await (await fetch(duongDan("extend"), {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({id: jobId, turns: extra, focus: focusDraft,
                           review: document.getElementById("review").checked})
@@ -1865,7 +2119,9 @@ async function extendShow() {
 async function poll() {
   let job;
   try {
-    const response = await fetch("/api/status?id=" + jobId);
+    const response = await fetch(CHIASE
+      ? "/s/" + CHIASE.token + "/data"
+      : "/api/status?id=" + jobId);
     if (!response.ok) return;
     job = await response.json();
   } catch (e) { return; } // Server may be restarting after a source edit.
@@ -2014,13 +2270,14 @@ async function pauseShow() {
   document.getElementById("pause").disabled = true;
   document.getElementById("hint").textContent =
     "Se tam dung sau khi xong luot hien tai...";
-  await fetch("/api/pause?id=" + jobId, {method: "POST"});
+  await fetch(duongDan("pause"), {method: "POST"});
 }
 
 async function retry() {
   const hint = document.getElementById("hint");
   hint.textContent = "Dang chay tiep...";
-  const data = await (await fetch("/api/retry?id=" + jobId, {method: "POST"})).json();
+  const data = await (await fetch(duongDan("retry"),
+                                  {method: "POST"})).json();
   if (data.error) { hint.textContent = "Khong chay tiep duoc: " + data.error; return; }
   document.getElementById("go").disabled = true;
   document.getElementById("pause").disabled = false;
@@ -2070,6 +2327,55 @@ async function exportShow() {
     exporting = false;
     btn.disabled = false;
   }
+}
+
+async function shareShow() {
+  if (!jobId) return;
+  const hint = document.getElementById("hint");
+  const btn = document.getElementById("share");
+  btn.disabled = true;
+  hint.textContent = "Dang tao link chia se...";
+  try {
+    const d = await (await fetch("/api/share?id=" + jobId,
+                                 {method: "POST"})).json();
+    if (d.error) { hint.textContent = "Khong tao duoc link: " + d.error; return; }
+    document.getElementById("share-qr").innerHTML = d.qr;
+    document.getElementById("share-url").value = d.url;
+    document.getElementById("share-control").checked = !!d.control;
+    document.getElementById("share-box").hidden = false;
+    hint.textContent = "";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function copyShareUrl() {
+  const o = document.getElementById("share-url");
+  o.select();
+  try {
+    await navigator.clipboard.writeText(o.value);
+    document.getElementById("share-copy").textContent = "Đã sao chép";
+    setTimeout(() => {
+      document.getElementById("share-copy").textContent = "Sao chép link";
+    }, 1500);
+  } catch (e) {
+    document.execCommand("copy");     // trinh duyet cu / khong co quyen
+  }
+}
+
+async function toggleShareControl(e) {
+  const hint = document.getElementById("hint");
+  const on = e.target.checked ? "1" : "0";
+  const d = await (await fetch(
+    "/api/share/control?id=" + jobId + "&on=" + on, {method: "POST"})).json();
+  if (d.error) {
+    hint.textContent = "Khong doi duoc: " + d.error;
+    e.target.checked = !e.target.checked;
+    return;
+  }
+  hint.textContent = d.control
+    ? "Link nay gio bam duoc Dao sau them / Chay tiep / Tam dung / Dung han."
+    : "Link nay tro lai che do chi xem.";
 }
 
 async function loadHistory() {
@@ -2144,7 +2450,7 @@ async function stop() {
   if (!jobId) return;
   document.getElementById("stop").disabled = true;
   document.getElementById("hint").textContent = "Se dung sau khi xong luot hien tai...";
-  await fetch("/api/stop?id=" + jobId, {method: "POST"});
+  await fetch(duongDan("stop"), {method: "POST"});
 }
 
 document.getElementById("to-top").addEventListener("click", scrollToTop);
@@ -2156,6 +2462,13 @@ document.getElementById("go").addEventListener("click", start);
 document.getElementById("pause").addEventListener("click", pauseShow);
 document.getElementById("stop").addEventListener("click", stop);
 document.getElementById("export").addEventListener("click", exportShow);
+document.getElementById("share").addEventListener("click", shareShow);
+document.getElementById("share-copy").addEventListener("click", copyShareUrl);
+document.getElementById("share-control")
+        .addEventListener("change", toggleShareControl);
+document.getElementById("share-close").addEventListener("click", () => {
+  document.getElementById("share-box").hidden = true;
+});
 ["export-from", "export-to"].forEach(id =>
   document.getElementById(id).addEventListener(
     "input", () => { xuatTuDong = false; }));
@@ -2187,6 +2500,15 @@ window.addEventListener("beforedevreload", () => {
 });
 
 async function initialize() {
+  if (CHIASE) {
+    // Che do chi-xem: khong goi /api/* (server chan tu may khac), chi doc
+    // bien ban cua dung buoi duoc chia se.
+    document.body.classList.add("chi-xem");
+    jobId = CHIASE.token;
+    await poll();
+    timer = setInterval(poll, 2000);   // cham hon vi qua mang
+    return;
+  }
   let view = null;
   try {
     view = JSON.parse(sessionStorage.getItem("talkshow.reloadView"));
@@ -2231,12 +2553,112 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def tai_cho(self) -> bool:
+        """
+        Yeu cau nay den tu chinh may nay khong?
+
+        Server mo ra ca mang noi bo de dien thoai xem duoc bien ban, nhung
+        MOI THAO TAC DIEU KHIEN chi cho phep tu may nay. Neu khong, ai trong
+        mang cung bam duoc "Bat dau" va tieu han muc tai khoan AI cua ban.
+        """
+        return self.client_address[0] in ("127.0.0.1", "::1", "localhost")
+
+    def tu_choi_xa(self) -> bool:
+        """Chan yeu cau tu may khac. Tra ve True neu da chan."""
+        if self.tai_cho():
+            return False
+        self._send(403, json.dumps(
+            {"error": "Chức năng này chỉ dùng được trên máy chạy server. "
+                      "Link chia sẻ chỉ để xem biên bản."}, ensure_ascii=False))
+        return True
+
+    def trang_chia_se(self, token: str):
+        """Trang xem mot buoi, mo bang link chia se."""
+        show_id, dieu_khien = share_by_token(token)
+        if not show_id:
+            return self._send(404, "<h1>Link chia sẻ không còn hiệu lực.</h1>",
+                              "text/html; charset=utf-8")
+        cfg = json.dumps({"token": token, "control": dieu_khien},
+                         ensure_ascii=False)
+        return self._send(200, PAGE.replace('"__SHARE_CFG__"', cfg),
+                          "text/html; charset=utf-8")
+
+    def viec_chia_se(self, token: str, viec: str):
+        """
+        Thiet bi khac bam nut dieu khien tren link chia se.
+
+        Chi nhan nhung viec trong SHARE_ACTIONS, va chi khi link do da duoc
+        bat quyen dieu khien tu may nay. Ma buoi lay tu token chu khong lay
+        tu tham so, nen khong the tro sang buoi khac.
+        """
+        show_id, dieu_khien = share_by_token(token)
+        if not show_id:
+            return self._send(404, '{"error":"link khong con hieu luc"}')
+        if not dieu_khien:
+            return self._send(403, json.dumps(
+                {"error": "Link này chỉ để xem. Bật “cho phép điều khiển” "
+                          "ở máy chạy server nếu muốn bấm từ đây."},
+                ensure_ascii=False))
+        if viec not in SHARE_ACTIONS:
+            return self._send(403, json.dumps(
+                {"error": f"Việc “{viec}” chỉ làm được trên máy chạy server."},
+                ensure_ascii=False))
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            data = json.loads(self.rfile.read(length) or b"{}")
+        except ValueError:
+            data = {}
+
+        try:
+            if viec == "extend":
+                extend_job(show_id,
+                           max(1, min(20, int(data.get("turns") or 3))),
+                           data.get("focus") or "",
+                           bool(data.get("review")))
+            elif viec == "retry":
+                retry_job(show_id)
+            elif viec == "pause":
+                with LOCK:
+                    JOBS[show_id]["pause_requested"] = True
+            elif viec == "stop":
+                with LOCK:
+                    JOBS[show_id]["stop_requested"] = True
+            elif viec == "review":
+                answer_review(show_id, data.get("action") or "send",
+                              data.get("text"))
+        except Exception as e:
+            return self._send(400, json.dumps({"error": str(e)},
+                                              ensure_ascii=False))
+        return self._send(200, '{"ok":true}')
+
     def do_GET(self):
         path = urlparse(self.path).path
+
+        # Link chia se: mo duoc tu bat ky thiet bi nao trong mang
+        if path.startswith("/s/"):
+            phan = path[3:].split("/")
+            token = phan[0]
+            if len(phan) == 1:
+                return self.trang_chia_se(token)
+            if len(phan) == 2 and phan[1] == "data":
+                show_id = show_by_token(token)
+                with LOCK:
+                    job = JOBS.get(show_id) if show_id else None
+                    body = (json.dumps(job, ensure_ascii=False) if job
+                            else '{"error":"khong co buoi nay"}')
+                return self._send(200 if job else 404, body)
+            return self._send(404, '{"error":"khong co trang nay"}')
+
         if path == dev_reload.VERSION_PATH:
             return self._send(200, json.dumps({"version": dev_reload.VERSION}))
+
+        # Tu day tro xuong la giao dien dieu khien — chi may nay dung duoc
+        if self.tu_choi_xa():
+            return
         if path == "/":
-            return self._send(200, PAGE, "text/html; charset=utf-8")
+            return self._send(200, PAGE.replace('"__SHARE_CFG__"', "null"),
+                              "text/html; charset=utf-8")
         if path == "/api/tabs":
             return self._send(200, json.dumps(tabs_status(), ensure_ascii=False))
         if path == "/api/shows":
@@ -2254,6 +2676,16 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+
+        # Nut dieu khien bam tu link chia se — tu kiem tra quyen ben trong
+        if path.startswith("/s/"):
+            phan = path[3:].split("/")
+            if len(phan) == 2:
+                return self.viec_chia_se(phan[0], phan[1])
+            return self._send(404, '{"error":"khong co trang nay"}')
+
+        if self.tu_choi_xa():
+            return
 
         if path == "/api/stop":
             job_id = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
@@ -2335,6 +2767,29 @@ class Handler(BaseHTTPRequestHandler):
                                                   ensure_ascii=False))
             return self._send(200, '{"ok":true}')
 
+        if path == "/api/share":
+            job_id = (parse_qs(urlparse(self.path).query).get("id") or [""])[0]
+            try:
+                tin = share_info(job_id)
+                url = f"http://{lan_ip()}:{PORT}/s/{tin['token']}"
+                ket_qua = {"url": url, "qr": qr_svg(url),
+                           "control": tin["control"]}
+            except Exception as e:
+                return self._send(400, json.dumps({"error": str(e)},
+                                                  ensure_ascii=False))
+            return self._send(200, json.dumps(ket_qua, ensure_ascii=False))
+
+        if path == "/api/share/control":
+            q = parse_qs(urlparse(self.path).query)
+            job_id = (q.get("id") or [""])[0]
+            try:
+                set_share_control(job_id, (q.get("on") or ["0"])[0] == "1")
+                tin = share_info(job_id)
+            except Exception as e:
+                return self._send(400, json.dumps({"error": str(e)},
+                                                  ensure_ascii=False))
+            return self._send(200, json.dumps({"control": tin["control"]}))
+
         if path == "/api/export":
             query = parse_qs(urlparse(self.path).query, keep_blank_values=True)
             job_id = (query.get("id") or [""])[0]
@@ -2371,7 +2826,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     try:
-        server = Server(("127.0.0.1", PORT), Handler)
+        server = Server((HOST, PORT), Handler)
     except OSError:
         print(f"\n[!] Cong {PORT} dang bi mot tien trinh khac giu.")
         print(f"    Co the ban dang chay san 1 talkshow.py o cua so khac —")
